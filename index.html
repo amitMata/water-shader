@@ -1,0 +1,1521 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Ultra Ocean — Sea of Thieves style water</title>
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; background: #000; height: 100%; }
+  canvas { display: block; }
+  #hud {
+    position: fixed; left: 12px; bottom: 12px; color: #cfe8f0; z-index: 10;
+    font: 12px/1.6 "Segoe UI", sans-serif; text-shadow: 0 1px 3px rgba(0,0,0,.8);
+    background: rgba(4,16,24,.45); padding: 8px 12px; border-radius: 8px;
+    pointer-events: none; user-select: none;
+  }
+  #fps {
+    position: fixed; left: 12px; top: 12px; color: #9fd9c8; z-index: 10;
+    font: 12px/1.4 Consolas, monospace; text-shadow: 0 1px 3px rgba(0,0,0,.8);
+    pointer-events: none; user-select: none;
+  }
+  #underwater {
+    position: fixed; inset: 0; background: rgba(8, 44, 62, .55);
+    pointer-events: none; display: none; z-index: 5;
+  }
+  #err {
+    position: fixed; inset: 0; display: none; z-index: 100; color: #ffb0b0;
+    font: 14px/1.6 Consolas, monospace; padding: 40px; background: #150a0a;
+  }
+</style>
+</head>
+<body>
+<div id="hud">
+  <b>W/S</b> throttle &nbsp;·&nbsp; <b>A/D</b> rudder &nbsp;·&nbsp; <b>R</b> reset boats &nbsp;·&nbsp; drag to orbit, wheel to zoom
+</div>
+<div id="fps"></div>
+<div id="underwater"></div>
+<div id="err"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+
+window.addEventListener('error', (e) => {
+  const el = document.getElementById('err');
+  el.style.display = 'block';
+  el.textContent = 'Error: ' + (e.message || e.type) +
+    '\n\nIf the page is blank, the three.js CDN may be blocked from file:// pages.' +
+    '\nRun a local server instead:  python -m http.server 8000  (then open http://localhost:8000)';
+});
+
+// ---------------------------------------------------------------------------
+// Tunable parameters (everything here is wired to the GUI)
+// ---------------------------------------------------------------------------
+const params = {
+  // waves
+  windDirection: 125,     // degrees
+  directionSpread: 65,    // degrees of random spread around wind
+  maxWavelength: 95,      // biggest swell, meters
+  minWavelength: 3.5,     // smallest gerstner wave, meters
+  steepness: 0.68,        // total wave steepness budget (0..1)
+  amplitude: 1.0,         // global amplitude multiplier
+  choppiness: 1.2,        // horizontal gerstner pinching (crest sharpness)
+  randomness: 0.75,       // wavelength/height jitter — irregular, real-sea look
+  waveSpeed: 1.0,
+  waveCount: 48,
+  seed: 1337,
+
+  // surface detail (fragment-level micro normals)
+  detailStrength: 0.42,
+  detailScale: 0.4,
+
+  // foam
+  foamIntensity: 0.85,
+  crestBias: 0.62,        // jacobian threshold — higher = more crest foam
+  edgeFoamWidth: 2.0,     // meters of shoreline/hull contact foam
+  foamScale: 0.22,
+  foamTrail: 0.9,         // seconds of foam persistence behind crests
+
+  // water body
+  deepColor: '#0e5a86',
+  shallowColor: '#2fc6b8',
+  sssColor: '#3fd6c0',
+  foamColor: '#f2f8f8',
+  clarity: 26,            // meters of visibility
+  refractionStrength: 0.9,
+  sssStrength: 0.9,
+  scatterStrength: 0.3,   // luminous tropical in-scatter glow
+
+  // environment
+  sunElevation: 45,
+  sunAzimuth: 135,
+  exposure: 1.18,
+  seafloorDepth: 12,
+
+  // clouds
+  cloudCover: 0.35,
+  cloudDensity: 0.9,
+  cloudScale: 1.0,
+  cloudSpeed: 1.0,
+  cloudEvolve: 1.0,       // how fast cloud shapes morph as they drift
+
+  // island & surf
+  islandHeight: 20,       // peak height above the flat seafloor
+  islandRadius: 110,
+  shoaling: 1.0,          // how strongly waves feel the bottom (grow + steepen)
+  surfFoam: 1.0,          // breaker / surf-zone foam intensity
+
+  // quality
+  quality: 'high',
+  meshResolution: 512,
+  rtScale: 0.75,
+  pixelRatio: Math.min(window.devicePixelRatio, 2),
+  cloudOctaves: 4,
+
+  // boats
+  followBoat: true,
+  buoyancyDamping: 0.3,
+  thrustPower: 2.6,
+
+  resetBoats() { resetBoats(); },
+  randomizeSeed() { params.seed = (Math.random() * 100000) | 0; rebuildSpectrum(); },
+};
+
+// pristine copy of every data param (functions are skipped) for "reset everything"
+const DEFAULTS = JSON.parse(JSON.stringify(params));
+
+const DEG = Math.PI / 180;
+const MAX_WAVES = 64;
+
+// ---------------------------------------------------------------------------
+// Wave spectrum — shared by GPU shader and CPU buoyancy sampling
+// ---------------------------------------------------------------------------
+const WS = { list: [], count: 0, chop: 1, ampSum: 1 };
+let phaseTime = 0; // accumulated time * waveSpeed, so speed changes don't jump phase
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const lerp = (a, b, t) => a + (b - a) * t;
+
+function rebuildSpectrum() {
+  const rng = mulberry32(params.seed);
+  const n = params.waveCount;
+  const jit = params.randomness;
+  const list = [];
+  // real seas are "crossed": a secondary swell arrives from a different direction
+  const secOffset = (rng() < 0.5 ? -1 : 1) * (45 + rng() * 45);
+  let rawSum = 0;
+  for (let i = 0; i < n; i++) {
+    const t = i / Math.max(n - 1, 1);
+    let L, ang, energy;
+    if (t < 0.4) {          // primary swell — long, roughly aligned with the wind
+      L = lerp(params.maxWavelength, params.maxWavelength * 0.5, t / 0.4);
+      ang = params.windDirection + (rng() * 2 - 1) * params.directionSpread * 0.35;
+      energy = 1.0;
+    } else if (t < 0.7) {   // secondary swell — medium wavelength, crossing direction
+      const s = (t - 0.4) / 0.3;
+      L = lerp(params.maxWavelength * 0.45, params.maxWavelength * 0.18, s);
+      ang = params.windDirection + secOffset + (rng() * 2 - 1) * params.directionSpread * 0.6;
+      energy = 0.62;
+    } else {                // wind chop — short waves with a very broad spread
+      const s = (t - 0.7) / 0.3;
+      L = lerp(params.maxWavelength * 0.16, params.minWavelength, s);
+      ang = params.windDirection + (rng() * 2 - 1) * params.directionSpread * 1.6;
+      energy = 0.5;
+    }
+    L = Math.max(L * (1 + (rng() * 2 - 1) * 0.35 * jit), params.minWavelength * 0.6);
+    const ampJit = Math.max(1 + (rng() * 2 - 1) * 0.85 * jit, 0.12);
+    const raw = (L / params.maxWavelength) * energy * ampJit;
+    const a = ang * DEG;
+    list.push({ dx: Math.cos(a), dz: Math.sin(a), L, raw, phase: rng() * Math.PI * 2, A: 0 });
+    rawSum += raw;
+  }
+  let ampSum = 0;
+  for (const w of list) {
+    const s = params.steepness * (w.raw / rawSum);       // per-wave steepness share
+    w.A = Math.max(s * w.L / (2 * Math.PI) * params.amplitude, 1e-4);
+    ampSum += w.A;
+  }
+  WS.list = list;
+  WS.count = n;
+  WS.chop = params.choppiness;
+  WS.ampSum = ampSum;
+
+  // push to shader uniforms
+  for (let i = 0; i < MAX_WAVES; i++) {
+    const v = waterUniforms.uWaves.value[i];
+    if (i < n) { const w = list[i]; v.set(w.dx, w.dz, w.A, w.L); waterUniforms.uPhases.value[i] = w.phase; }
+    else v.set(0, 0, 1e-4, 1);
+  }
+  waterUniforms.uNumWaves.value = n;
+  waterUniforms.uChop.value = params.choppiness;
+  waterUniforms.uAmpSum.value = ampSum;
+  waterUniforms.uWindDir.value.set(Math.cos(params.windDirection * DEG), Math.sin(params.windDirection * DEG));
+  shared.uCloudWind.value.copy(waterUniforms.uWindDir.value);
+}
+
+// ---------------------------------------------------------------------------
+// Island terrain — analytic, shared EXACTLY between water shader, seafloor
+// mesh, and CPU physics (three gaussian domes + a gentle shoreline ripple)
+// ---------------------------------------------------------------------------
+const ISLAND = { x: -130, z: -90 };
+function islandShape(x, z) { // height above the flat seafloor plane
+  const R = params.islandRadius, H = params.islandHeight;
+  const d1x = x - ISLAND.x, d1z = z - ISLAND.z;
+  const d2x = x - (ISLAND.x + 0.5 * R), d2z = z - (ISLAND.z + 0.3 * R);
+  const d3x = x - (ISLAND.x - 0.4 * R), d3z = z - (ISLAND.z - 0.55 * R);
+  let h = H * Math.exp(-(d1x * d1x + d1z * d1z) / (R * R))
+        + H * 0.45 * Math.exp(-(d2x * d2x + d2z * d2z) / (R * R * 0.3025))
+        + H * 0.3 * Math.exp(-(d3x * d3x + d3z * d3z) / (R * R * 0.16));
+  h += 0.8 * Math.sin(x * 0.11 + 1.7) * Math.cos(z * 0.09 + 0.4)
+     + 2.4 * Math.sin(x * 0.033 + 0.9) * Math.cos(z * 0.027 + 2.3); // irregular coastline
+  return h;
+}
+function terrainWorldY(x, z) { return islandShape(x, z) - params.seafloorDepth; }
+
+// CPU-side gerstner (exact mirror of the vertex shader math, incl. shoaling)
+const _disp = new THREE.Vector3();
+function waveDisplacement(px, pz, t, out) {
+  let dx = 0, dy = 0, dz = 0;
+  const n = WS.count, chop = WS.chop;
+  const d = Math.max(-terrainWorldY(px, pz), 0.12);
+  const sh = params.shoaling;
+  for (let i = 0; i < n; i++) {
+    const w = WS.list[i];
+    const k = (2 * Math.PI) / w.L;
+    const om = Math.sqrt(9.81 * k);
+    const kd = Math.min(k * d, 10);
+    const tk = Math.tanh(kd);
+    const shoalA = 1 + (Math.min(1 / Math.sqrt(Math.max(tk, 0.05)), 2.2) - 1) * sh;
+    const Aeff = Math.min(w.A * shoalA, 0.5 * d);
+    const qa = chop * (1 + sh * (1 - tk) * 1.5) / (k * n);
+    const th = k * (w.dx * px + w.dz * pz) - om * t + w.phase;
+    const S = Math.sin(th), C = Math.cos(th);
+    dx += qa * w.dx * C;
+    dz += qa * w.dz * C;
+    dy += Aeff * S;
+  }
+  out.set(dx, dy, dz);
+  return out;
+}
+// True height at world (x,z): invert the horizontal gerstner displacement iteratively
+function waterHeightAt(x, z, t) {
+  let px = x, pz = z;
+  for (let i = 0; i < 3; i++) {
+    waveDisplacement(px, pz, t, _disp);
+    px = x - _disp.x;
+    pz = z - _disp.z;
+  }
+  waveDisplacement(px, pz, t, _disp);
+  return _disp.y;
+}
+
+// ---------------------------------------------------------------------------
+// Renderer / scene / camera
+// ---------------------------------------------------------------------------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(params.pixelRatio);
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = params.exposure;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.5, 20000);
+camera.position.set(20, 10, 30);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.minDistance = 4;
+controls.maxDistance = 400;
+controls.maxPolarAngle = Math.PI * 0.58; // allow dipping slightly underwater
+controls.target.set(0, 1, 0);
+
+// smooth scroll zoom — OrbitControls' built-in wheel dolly is stepped/notchy,
+// so we drive the dolly distance ourselves with exponential easing
+controls.enableZoom = false;
+let zoomTarget = camera.position.distanceTo(controls.target);
+renderer.domElement.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  zoomTarget = THREE.MathUtils.clamp(
+    zoomTarget * Math.exp(e.deltaY * 0.0011),
+    controls.minDistance, controls.maxDistance);
+}, { passive: false });
+
+const sunLight = new THREE.DirectionalLight(0xffffff, 2.5);
+scene.add(sunLight);
+const hemi = new THREE.HemisphereLight(0x88aabb, 0x113344, 0.6);
+scene.add(hemi);
+
+// ---------------------------------------------------------------------------
+// Shared shader uniforms (sun/sky/time — one object, referenced everywhere)
+// ---------------------------------------------------------------------------
+const shared = {
+  uTime: { value: 0 },
+  uSunDir: { value: new THREE.Vector3(0, 1, 0) },
+  uSunColor: { value: new THREE.Color(1, 1, 1) },
+  uZenith: { value: new THREE.Color(0.1, 0.3, 0.65) },
+  uHorizon: { value: new THREE.Color(0.58, 0.76, 0.92) },
+  uExposure: { value: params.exposure },
+  uClarity: { value: params.clarity },
+  uCloudCover: { value: params.cloudCover },
+  uCloudDensity: { value: params.cloudDensity },
+  uCloudScale: { value: params.cloudScale },
+  uCloudTime: { value: 0 },
+  uCloudEvolve: { value: 0 },
+  uCloudWind: { value: new THREE.Vector2(1, 0) },
+  uCloudOct: { value: 4 },
+};
+
+const GLSL_COMMON = /* glsl */`
+  uniform vec3 uSunDir;
+  uniform vec3 uSunColor;
+  uniform vec3 uZenith;
+  uniform vec3 uHorizon;
+  uniform float uExposure;
+  uniform float uCloudCover;
+  uniform float uCloudDensity;
+  uniform float uCloudScale;
+  uniform float uCloudTime;
+  uniform float uCloudEvolve;
+  uniform vec2 uCloudWind;
+  uniform int uCloudOct;
+
+  float hash12(vec2 p) {
+    p = fract(p * vec2(123.34, 456.21));
+    p += dot(p, p + 45.32);
+    return fract(p.x * p.y);
+  }
+  float vnoise(vec2 p) {
+    vec2 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = hash12(i);
+    float b = hash12(i + vec2(1.0, 0.0));
+    float c = hash12(i + vec2(0.0, 1.0));
+    float d = hash12(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+  }
+  float fbm(vec2 p) {
+    float v = 0.0, a = 0.5;
+    for (int i = 0; i < 4; i++) {
+      v += a * vnoise(p);
+      p = p * 2.13 + vec2(17.7, 9.2);
+      a *= 0.5;
+    }
+    return v;
+  }
+  float hash13(vec3 p3) {
+    p3 = fract(p3 * 0.1031);
+    p3 += dot(p3, p3.zyx + 31.32);
+    return fract((p3.x + p3.y) * p3.z);
+  }
+  float vnoise3(vec3 p) {
+    vec3 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float n000 = hash13(i);
+    float n100 = hash13(i + vec3(1, 0, 0));
+    float n010 = hash13(i + vec3(0, 1, 0));
+    float n110 = hash13(i + vec3(1, 1, 0));
+    float n001 = hash13(i + vec3(0, 0, 1));
+    float n101 = hash13(i + vec3(1, 0, 1));
+    float n011 = hash13(i + vec3(0, 1, 1));
+    float n111 = hash13(i + vec3(1, 1, 1));
+    return mix(mix(mix(n000, n100, f.x), mix(n010, n110, f.x), f.y),
+               mix(mix(n001, n101, f.x), mix(n011, n111, f.x), f.y), f.z);
+  }
+  // 3D fbm with time as the third axis: cloud shapes form, morph, and dissolve.
+  // Finer octaves evolve faster, like real cumulus wisps.
+  float cloudFbm(vec2 p, float t) {
+    float v = 0.0, a = 0.5;
+    for (int i = 0; i < 5; i++) {
+      if (i >= uCloudOct) break;
+      v += a * vnoise3(vec3(p, t));
+      p = p * 2.23 + vec2(31.7, 17.3);
+      t = t * 1.9 + 7.3;
+      a *= 0.5;
+    }
+    // normalize so cover/contrast stay stable across octave counts
+    return v * 0.9375 / (1.0 - pow(0.5, float(uCloudOct)));
+  }
+  vec3 skyColor(vec3 dir) {
+    float y = clamp(dir.y, -1.0, 1.0);
+    vec3 col = mix(uHorizon, uZenith, pow(max(y, 0.0), 0.45));
+    col = mix(col, uHorizon * 1.08, pow(1.0 - max(y, 0.0), 8.0) * 0.35); // horizon haze
+    if (y < 0.0) col = mix(uHorizon, uHorizon * 0.25, clamp(-y * 6.0, 0.0, 1.0));
+    float sd = max(dot(dir, uSunDir), 0.0);
+    col += uSunColor * pow(sd, 1400.0) * 60.0;                   // sun disc
+    col += uSunColor * (pow(sd, 32.0) * 0.22 + pow(sd, 4.0) * 0.05); // glow
+    // procedural cumulus layer, composited over the sun so cover occludes it
+    if (uCloudCover > 0.005 && y > 0.015) {
+      vec2 cuv = dir.xz / (y + 0.15) * 0.55 * uCloudScale + uCloudWind * uCloudTime * 0.03;
+      float den = cloudFbm(cuv, uCloudEvolve);
+      float det = cloudFbm(cuv * 3.1 + 40.0, uCloudEvolve * 1.7);
+      float thr = mix(0.80, 0.30, clamp(uCloudCover, 0.0, 1.0));
+      float cl = clamp(smoothstep(thr, thr + 0.16, den + det * 0.22) * uCloudDensity, 0.0, 1.0);
+      if (cl > 0.002) {
+        // self-shadowing: sample density toward the sun, thick side goes gray
+        float den2 = cloudFbm(cuv + normalize(uSunDir.xz + vec2(1e-4, 0.0)) * 0.1, uCloudEvolve);
+        float shade = clamp(0.5 + (den - den2) * 4.0, 0.15, 1.0);
+        vec3 lit = uSunColor * 0.42 + uHorizon * 0.25;   // bright white puffs
+        vec3 dark = vec3(0.38, 0.41, 0.47) * clamp(uSunDir.y * 1.6, 0.15, 1.0);
+        vec3 ccol = mix(dark, lit, shade);
+        ccol += uSunColor * pow(sd, 12.0) * 0.35 * (1.0 - cl * 0.6); // silver lining
+        col = mix(col, ccol, cl * smoothstep(0.015, 0.15, y));
+      }
+    }
+    return col;
+  }
+  vec3 acesTone(vec3 x) {
+    return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+  }
+  vec3 finalColor(vec3 linear) {
+    return pow(acesTone(linear * uExposure), vec3(1.0 / 2.2));
+  }
+`;
+
+// ---------------------------------------------------------------------------
+// Sky dome
+// ---------------------------------------------------------------------------
+const skyMat = new THREE.ShaderMaterial({
+  side: THREE.BackSide,
+  depthWrite: false,
+  uniforms: {
+    uSunDir: shared.uSunDir, uSunColor: shared.uSunColor,
+    uZenith: shared.uZenith, uHorizon: shared.uHorizon, uExposure: shared.uExposure,
+    uCloudCover: shared.uCloudCover, uCloudDensity: shared.uCloudDensity,
+    uCloudScale: shared.uCloudScale, uCloudTime: shared.uCloudTime,
+    uCloudEvolve: shared.uCloudEvolve, uCloudWind: shared.uCloudWind,
+    uCloudOct: shared.uCloudOct,
+  },
+  vertexShader: /* glsl */`
+    varying vec3 vDir;
+    void main() {
+      vDir = position;
+      vec4 wp = modelMatrix * vec4(position, 1.0);
+      gl_Position = projectionMatrix * viewMatrix * wp;
+    }
+  `,
+  fragmentShader: GLSL_COMMON + /* glsl */`
+    varying vec3 vDir;
+    void main() {
+      vec3 col = skyColor(normalize(vDir));
+      gl_FragColor = vec4(finalColor(col), 1.0);
+    }
+  `,
+});
+const skyDome = new THREE.Mesh(new THREE.SphereGeometry(9000, 48, 24), skyMat);
+skyDome.frustumCulled = false;
+scene.add(skyDome);
+
+// ---------------------------------------------------------------------------
+// Seafloor (custom shader: sand + animated caustics + depth absorption)
+// ---------------------------------------------------------------------------
+const underwaterGroup = new THREE.Group();
+scene.add(underwaterGroup);
+
+const floorMat = new THREE.ShaderMaterial({
+  uniforms: {
+    uTime: shared.uTime,
+    uSunDir: shared.uSunDir, uSunColor: shared.uSunColor,
+    uZenith: shared.uZenith, uHorizon: shared.uHorizon, uExposure: shared.uExposure,
+    uClarity: shared.uClarity,
+    uApplyTM: { value: 1.0 }, // tonemap only in the main pass; refraction RT stays linear
+  },
+  vertexShader: /* glsl */`
+    varying vec3 vWp;
+    varying vec3 vN;
+    void main() {
+      vec4 wp = modelMatrix * vec4(position, 1.0);
+      vWp = wp.xyz;
+      vN = normalize(mat3(modelMatrix) * normal);
+      gl_Position = projectionMatrix * viewMatrix * wp;
+    }
+  `,
+  fragmentShader: GLSL_COMMON + /* glsl */`
+    uniform float uTime;
+    uniform float uClarity;
+    uniform float uApplyTM;
+    varying vec3 vWp;
+    varying vec3 vN;
+    void main() {
+      vec3 N = normalize(vN);
+      // sandy albedo with patchy variation
+      float sandPatch = fbm(vWp.xz * 0.08);
+      vec3 albedo = mix(vec3(0.70, 0.62, 0.45), vec3(0.54, 0.48, 0.36), sandPatch);
+      albedo *= 0.88 + 0.24 * fbm(vWp.xz * 0.9);
+      // dark mottled reef / seagrass patches on the submerged sand
+      float reef = smoothstep(0.55, 0.75, fbm(vWp.xz * 0.045 + 13.7));
+      reef *= smoothstep(-0.6, -2.2, vWp.y);   // underwater only
+      albedo = mix(albedo, vec3(0.12, 0.20, 0.15), reef * 0.85);
+      // beach zones: dark wet swash band at the waterline, pale dry sand,
+      // then vegetation on the high ground
+      float wet = smoothstep(-1.4, -0.3, vWp.y) * smoothstep(1.1, 0.15, vWp.y);
+      albedo = mix(albedo, albedo * 0.5, wet * 0.9);
+      float dry = smoothstep(0.4, 1.4, vWp.y);
+      albedo = mix(albedo, vec3(0.76, 0.66, 0.47), dry * 0.75);
+      float veg = smoothstep(3.2, 6.0, vWp.y + (fbm(vWp.xz * 0.13) - 0.5) * 4.0);
+      vec3 grass = mix(vec3(0.09, 0.19, 0.05), vec3(0.19, 0.29, 0.09), fbm(vWp.xz * 0.35));
+      albedo = mix(albedo, grass, veg);
+      // animated caustics: two moving ridge layers multiplied (underwater only)
+      vec2 cp = vWp.xz * 0.45;
+      float n1 = 1.0 - abs(2.0 * fbm(cp + vec2(uTime * 0.06, uTime * 0.045)) - 1.0);
+      float n2 = 1.0 - abs(2.0 * fbm(cp * 1.63 - vec2(uTime * 0.05, uTime * 0.07)) - 1.0);
+      float caustic = pow(clamp(n1 * n2 + 0.15, 0.0, 1.0), 5.0) * 3.0;
+      caustic *= smoothstep(0.2, -0.5, vWp.y);
+      float depth = max(-vWp.y, 0.0);
+      // downward sunlight absorption (red dies first)
+      vec3 absorb = vec3(0.9, 0.32, 0.22) * (6.0 / uClarity) * 0.6;
+      vec3 sunReach = exp(-depth * absorb);
+      float ndl = max(dot(N, uSunDir), 0.0);
+      float sunUp = clamp(uSunDir.y * 2.0, 0.05, 1.0);
+      vec3 light = uSunColor * 0.32 * (ndl + caustic * sunUp) * sunReach
+                 + uZenith * 0.5 + uHorizon * 0.12;
+      vec3 col = albedo * light;
+      if (uApplyTM > 0.5) col = finalColor(col);
+      gl_FragColor = vec4(col, 1.0);
+    }
+  `,
+});
+
+{
+  const floorGeo = new THREE.PlaneGeometry(12000, 12000, 200, 200);
+  floorGeo.rotateX(-Math.PI / 2);
+  const pos = floorGeo.attributes.position;
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i), z = pos.getZ(i);
+    const h = Math.sin(x * 0.05 + 1.3) * Math.cos(z * 0.043 + 0.7) * 1.0
+            + Math.sin(x * 0.021 + 4.0) * Math.cos(z * 0.017 + 2.1) * 1.6;
+    pos.setY(i, h);
+  }
+  floorGeo.computeVertexNormals();
+  const floor = new THREE.Mesh(floorGeo, floorMat);
+  underwaterGroup.add(floor);
+
+  // rocks
+  const rockMat = new THREE.MeshStandardMaterial({ color: 0x5a5148, roughness: 0.95 });
+  const rng = mulberry32(99);
+  for (let i = 0; i < 26; i++) {
+    const r = 0.8 + rng() * 3.2;
+    const rock = new THREE.Mesh(new THREE.DodecahedronGeometry(r, 1), rockMat);
+    rock.position.set((rng() * 2 - 1) * 90, r * 0.3, (rng() * 2 - 1) * 90);
+    rock.rotation.set(rng() * 3, rng() * 3, rng() * 3);
+    rock.scale.y = 0.5 + rng() * 0.5;
+    underwaterGroup.add(rock);
+  }
+}
+function updateSeafloorDepth() {
+  underwaterGroup.position.y = -params.seafloorDepth;
+  waterUniforms.uFloorY.value = -params.seafloorDepth;
+  rebuildIsland(); // palm visibility depends on the waterline
+}
+
+// ---------------------------------------------------------------------------
+// Ocean surface
+// ---------------------------------------------------------------------------
+const sceneRT = makeRT();
+function makeRT() {
+  const s = params.rtScale;
+  const size = renderer.getDrawingBufferSize(new THREE.Vector2());
+  const rt = new THREE.WebGLRenderTarget(
+    Math.max(2, Math.floor(size.x * s)),
+    Math.max(2, Math.floor(size.y * s)),
+    { type: THREE.HalfFloatType, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: false }
+  );
+  rt.depthTexture = new THREE.DepthTexture(rt.width, rt.height);
+  return rt;
+}
+function resizeRT() {
+  const size = renderer.getDrawingBufferSize(new THREE.Vector2());
+  sceneRT.setSize(Math.max(2, Math.floor(size.x * params.rtScale)), Math.max(2, Math.floor(size.y * params.rtScale)));
+}
+
+const waterUniforms = {
+  uTime: shared.uTime,
+  uNumWaves: { value: 0 },
+  uWaves: { value: Array.from({ length: MAX_WAVES }, () => new THREE.Vector4(0, 0, 1e-4, 1)) },
+  uPhases: { value: new Array(MAX_WAVES).fill(0) },
+  uChop: { value: params.choppiness },
+  uAmpSum: { value: 1 },
+  uWindDir: { value: new THREE.Vector2(1, 0) },
+  uFoamTrail: { value: params.foamTrail },
+  uIslandC: { value: new THREE.Vector2(ISLAND.x, ISLAND.z) },
+  uIslandH: { value: params.islandHeight },
+  uIslandR: { value: params.islandRadius },
+  uFloorY: { value: -params.seafloorDepth },
+  uShoal: { value: params.shoaling },
+  uSurfFoam: { value: params.surfFoam },
+
+  uSceneTex: { value: sceneRT.texture },
+  uDepthTex: { value: sceneRT.depthTexture },
+  uResolution: { value: new THREE.Vector2(1, 1) },
+  uNear: { value: camera.near },
+  uFar: { value: camera.far },
+
+  uSunDir: shared.uSunDir, uSunColor: shared.uSunColor,
+  uZenith: shared.uZenith, uHorizon: shared.uHorizon, uExposure: shared.uExposure,
+  uClarity: shared.uClarity,
+  uCloudCover: shared.uCloudCover, uCloudDensity: shared.uCloudDensity,
+  uCloudScale: shared.uCloudScale, uCloudTime: shared.uCloudTime,
+  uCloudEvolve: shared.uCloudEvolve, uCloudWind: shared.uCloudWind,
+  uCloudOct: shared.uCloudOct,
+
+  uDeepColor: { value: new THREE.Color(params.deepColor).convertSRGBToLinear() },
+  uShallowColor: { value: new THREE.Color(params.shallowColor).convertSRGBToLinear() },
+  uSSSColor: { value: new THREE.Color(params.sssColor).convertSRGBToLinear() },
+  uFoamColor: { value: new THREE.Color(params.foamColor).convertSRGBToLinear() },
+  uRefrStrength: { value: params.refractionStrength },
+  uSSSStrength: { value: params.sssStrength },
+  uScatter: { value: params.scatterStrength },
+  uFoamIntensity: { value: params.foamIntensity },
+  uCrestBias: { value: params.crestBias },
+  uEdgeWidth: { value: params.edgeFoamWidth },
+  uFoamScale: { value: params.foamScale },
+  uDetailStrength: { value: params.detailStrength },
+  uDetailScale: { value: params.detailScale },
+};
+
+const waterMat = new THREE.ShaderMaterial({
+  side: THREE.DoubleSide,
+  uniforms: waterUniforms,
+  vertexShader: /* glsl */`
+    #define MAX_WAVES ${MAX_WAVES}
+    uniform float uTime;
+    uniform int uNumWaves;
+    uniform vec4 uWaves[MAX_WAVES];   // dir.x, dir.z, amplitude, wavelength
+    uniform float uPhases[MAX_WAVES];
+    uniform float uChop;
+    uniform float uAmpSum;
+    uniform float uFoamTrail;
+    uniform vec2 uIslandC;
+    uniform float uIslandH;
+    uniform float uIslandR;
+    uniform float uFloorY;
+    uniform float uShoal;
+    uniform float uSurfFoam;
+    varying vec3 vWorldPos;
+    varying vec3 vNormal;
+    varying float vJ;      // jacobian for crest foam
+    varying float vCrest;  // normalized height for SSS
+    varying float vViewZ;
+    varying float vBreak;  // breaking / surf-zone foam factor
+
+    float tanhc(float x) {  // tanh() is unavailable in GLSL ES 1.00
+      float e = exp(2.0 * x);
+      return (e - 1.0) / (e + 1.0);
+    }
+
+    float terrainY(vec2 p) {  // must mirror islandShape() in JS exactly
+      float R = uIslandR;
+      vec2 d1 = p - uIslandC;
+      vec2 d2 = p - (uIslandC + vec2(0.5, 0.3) * R);
+      vec2 d3 = p - (uIslandC + vec2(-0.4, -0.55) * R);
+      float h = uIslandH * exp(-dot(d1, d1) / (R * R))
+              + uIslandH * 0.45 * exp(-dot(d2, d2) / (R * R * 0.3025))
+              + uIslandH * 0.3 * exp(-dot(d3, d3) / (R * R * 0.16));
+      h += 0.8 * sin(p.x * 0.11 + 1.7) * cos(p.y * 0.09 + 0.4)
+         + 2.4 * sin(p.x * 0.033 + 0.9) * cos(p.y * 0.027 + 2.3); // irregular coastline
+      return uFloorY + h;
+    }
+
+    void main() {
+      vec3 wp = (modelMatrix * vec4(position, 1.0)).xyz;
+      vec2 p = wp.xz;
+      float dpt = max(-terrainY(p), 0.12);  // local water depth
+      vec3 disp = vec3(0.0);
+      vec3 tx = vec3(1.0, 0.0, 0.0);
+      vec3 tz = vec3(0.0, 0.0, 1.0);
+      float jxx = 0.0, jzz = 0.0, jxz = 0.0;
+      float jxxB = 0.0, jzzB = 0.0, jxzB = 0.0;  // jacobian at t - trail*0.7
+      float jxxC = 0.0, jzzC = 0.0, jxzC = 0.0;  // jacobian at t - trail*1.4
+      for (int i = 0; i < MAX_WAVES; i++) {
+        if (i >= uNumWaves) break;
+        vec2 D = uWaves[i].xy;
+        float A = uWaves[i].z;
+        float L = uWaves[i].w;
+        float k = 6.2831853 / L;
+        float om = sqrt(9.81 * k);
+        // shoaling: waves feel the bottom, grow (Green's law-ish), then the
+        // 0.5*depth breaking limit caps them right at the shoreline
+        float kd = min(k * dpt, 10.0);
+        float tk = tanhc(kd);
+        float shoalA = 1.0 + (clamp(inversesqrt(max(tk, 0.05)), 1.0, 2.2) - 1.0) * uShoal;
+        float Aeff = min(A * shoalA, 0.5 * dpt);
+        float qa = uChop * (1.0 + uShoal * (1.0 - tk) * 1.5) / float(uNumWaves); // crests pitch forward in shallows
+        float th = k * dot(D, p) - om * uTime + uPhases[i];
+        float S = sin(th), C = cos(th);
+        disp += vec3((qa / k) * D.x * C, Aeff * S, (qa / k) * D.y * C);
+        float kA = k * Aeff;
+        tx += vec3(-qa * D.x * D.x * S, kA * D.x * C, -qa * D.x * D.y * S);
+        tz += vec3(-qa * D.x * D.y * S, kA * D.y * C, -qa * D.y * D.y * S);
+        float qxx = qa * D.x * D.x, qzz = qa * D.y * D.y, qxz = qa * D.x * D.y;
+        jxx -= qxx * S;  jzz -= qzz * S;  jxz -= qxz * S;
+        float SB = sin(th + om * uFoamTrail * 0.7);
+        float SC = sin(th + om * uFoamTrail * 1.4);
+        jxxB -= qxx * SB; jzzB -= qzz * SB; jxzB -= qxz * SB;
+        jxxC -= qxx * SC; jzzC -= qzz * SC; jxzC -= qxz * SC;
+      }
+      vec3 dwp = wp + disp;
+      vNormal = normalize(cross(tz, tx));
+      float JA = (1.0 + jxx) * (1.0 + jzz) - jxz * jxz;
+      float JB = (1.0 + jxxB) * (1.0 + jzzB) - jxzB * jxzB;
+      float JC = (1.0 + jxxC) * (1.0 + jzzC) - jxzC * jxzC;
+      // min over recent history = foam lingers and trails behind breaking crests
+      vJ = min(JA, min(JB * 1.07, JC * 1.15));
+      // breaking: crest height vs local depth, plus a frothy ambient surf zone
+      float steep = disp.y / max(dpt, 0.15);
+      float brk = smoothstep(0.28, 0.6, steep) * uShoal;
+      brk += smoothstep(2.2, 0.4, dpt) * 0.25;
+      vBreak = clamp(brk * uSurfFoam, 0.0, 1.5);
+      vCrest = disp.y / max(uAmpSum * 0.6, 0.001);
+      vWorldPos = dwp;
+      vec4 mv = viewMatrix * vec4(dwp, 1.0);
+      vViewZ = mv.z;
+      gl_Position = projectionMatrix * mv;
+    }
+  `,
+  fragmentShader: GLSL_COMMON + /* glsl */`
+    uniform sampler2D uSceneTex;
+    uniform sampler2D uDepthTex;
+    uniform vec2 uResolution;
+    uniform float uNear;
+    uniform float uFar;
+    uniform float uTime;
+    uniform float uClarity;
+    uniform vec3 uDeepColor;
+    uniform vec3 uShallowColor;
+    uniform vec3 uSSSColor;
+    uniform vec3 uFoamColor;
+    uniform float uRefrStrength;
+    uniform float uSSSStrength;
+    uniform float uScatter;
+    uniform float uFoamIntensity;
+    uniform float uCrestBias;
+    uniform float uEdgeWidth;
+    uniform float uFoamScale;
+    uniform float uDetailStrength;
+    uniform float uDetailScale;
+    uniform vec2 uWindDir;
+    varying vec3 vWorldPos;
+    varying vec3 vNormal;
+    varying float vJ;
+    varying float vCrest;
+    varying float vViewZ;
+    varying float vBreak;
+
+    float viewZFromDepth(float d) {
+      return (uNear * uFar) / ((uFar - uNear) * d - uFar);
+    }
+
+    void main() {
+      vec3 N = normalize(vNormal);
+      float distCam = length(vWorldPos - cameraPosition);
+      float detailFade = 1.0 - smoothstep(60.0, 500.0, distCam);
+
+      // micro-detail normals: two scrolling fbm layers, gradient via finite diff
+      if (uDetailStrength > 0.001 && detailFade > 0.01) {
+        vec2 p1 = vWorldPos.xz * uDetailScale + uWindDir * uTime * 0.35;
+        p1 += (vec2(fbm(p1 * 0.22 + 3.1), fbm(p1 * 0.22 + 9.4)) - 0.5) * 1.8; // break repetition
+        vec2 p2 = vWorldPos.xz * uDetailScale * 3.1 - uWindDir * uTime * 0.55;
+        float e = 0.35;
+        float h1 = fbm(p1);
+        vec2 g1 = vec2(fbm(p1 + vec2(e, 0.0)) - h1, fbm(p1 + vec2(0.0, e)) - h1);
+        float h2 = fbm(p2);
+        vec2 g2 = vec2(fbm(p2 + vec2(e, 0.0)) - h2, fbm(p2 + vec2(0.0, e)) - h2);
+        vec2 g = (g1 + 0.5 * g2) / e;
+        N = normalize(N + vec3(-g.x, 0.0, -g.y) * uDetailStrength * detailFade);
+      }
+      if (!gl_FrontFacing) N = -N;
+
+      vec3 V = normalize(cameraPosition - vWorldPos);
+      float NdV = max(dot(N, V), 0.0);
+      float fresnel = 0.02 + 0.98 * pow(1.0 - NdV, 5.0);
+      fresnel *= 1.0 - clamp(vBreak, 0.0, 1.0) * 0.5;  // churned water reflects poorly
+
+      // scene depth behind the water -> water thickness along the view ray
+      vec2 suv = gl_FragCoord.xy / uResolution;
+      float sceneZ = viewZFromDepth(texture2D(uDepthTex, suv).x);
+      float thick = max(vViewZ - sceneZ, 0.0);
+
+      // refraction: offset screen uv by the normal, reject samples in front of the surface
+      vec2 ruv = suv + N.xz * uRefrStrength * 0.06 * clamp(12.0 / distCam, 0.08, 1.0) * clamp(thick, 0.0, 3.0);
+      ruv = clamp(ruv, vec2(0.002), vec2(0.998));
+      float rThick = vViewZ - viewZFromDepth(texture2D(uDepthTex, ruv).x);
+      if (rThick < 0.0) { ruv = suv; rThick = thick; }
+      vec3 refracted = texture2D(uSceneTex, ruv).rgb;
+
+      // Beer-Lambert absorption, real seawater ratios — red dies first, blue survives
+      vec3 absorb = vec3(1.0, 0.28, 0.16) * (6.0 / uClarity);
+      vec3 transmit = exp(-max(rThick, 0.0) * absorb);
+      float sunUp = clamp(uSunDir.y * 2.0, 0.05, 1.0);
+      vec3 under = mix(uDeepColor * sunUp, refracted, transmit);
+      // luminous tropical in-scatter: the water body itself glows cyan
+      under += uShallowColor * sunUp * (1.0 - exp(-min(thick, 25.0) * 0.28)) * uScatter * 0.35;
+      // aeration: breaking water fills with bubbles and goes milky
+      under = mix(under, uFoamColor * sunUp * 0.5, clamp(vBreak * 0.45, 0.0, 0.6));
+
+      // sky reflection + sun specular
+      vec3 R = reflect(-V, N);
+      R.y = max(R.y, 0.02);
+      vec3 refl = skyColor(normalize(R));
+      vec3 H = normalize(uSunDir + V);
+      float specPow = mix(700.0, 80.0, clamp(distCam / 900.0, 0.0, 1.0));
+      float ndh = max(dot(N, H), 0.0);
+      float spec = pow(ndh, specPow) * (specPow + 8.0) / 25.13
+                 + pow(ndh, 48.0) * 0.09;   // wide glitter lobe
+      vec3 specCol = uSunColor * spec * 0.7;
+
+      // subsurface scattering through backlit crests
+      float td = pow(max(dot(-V, uSunDir), 0.0), 3.0);
+      vec3 sss = uSSSColor * uSSSStrength * td * clamp(vCrest, 0.0, 1.5)
+               * (0.35 + 0.65 * (1.0 - NdV)) * sunUp
+               * (1.0 + vBreak * 0.8);  // backlit breaker faces glow green
+
+      // foam: crest (jacobian, with time-trail) + contact edges (hulls, rocks)
+      float crestFoam = clamp((uCrestBias - vJ) * 1.6, 0.0, 1.0) * uFoamIntensity;
+      float edgeFoam = 1.0 - clamp(thick / uEdgeWidth, 0.0, 1.0);
+      edgeFoam *= edgeFoam;
+      float foamAmt = clamp(crestFoam + edgeFoam * 0.55 + vBreak * (0.45 + 0.35 * uFoamIntensity), 0.0, 1.6);
+
+      // wind-aligned, domain-warped foam pattern: streaks advecting downwind
+      vec2 wd = normalize(uWindDir + vec2(1e-5));
+      vec2 fp = vec2(wd.x * vWorldPos.x + wd.y * vWorldPos.z,
+                    -wd.y * vWorldPos.x + wd.x * vWorldPos.z);
+      fp.x = fp.x * 0.5 - uTime * 0.9;   // stretch + advect along the wind
+      vec2 fw = (vec2(fbm(fp * uFoamScale * 0.5 + 2.7), fbm(fp * uFoamScale * 0.5 + 8.3)) - 0.5) * 2.4;
+      vec2 fq = fp * uFoamScale + fw;
+      float base = fbm(fq + uWindDir * uTime * 0.12);
+      float web = 1.0 - abs(2.0 * fbm(fq * 2.6 - uTime * 0.05) - 1.0);
+      web *= web;
+      float fpat = base * 0.62 + web * 0.55;
+
+      // lacy fringe where foam is thin, solid white core where it's dense
+      float lace = smoothstep(0.62 - foamAmt * 0.32, 0.88 - foamAmt * 0.32, fpat);
+      float core = smoothstep(0.75, 1.15, foamAmt);
+      float foam = clamp(foamAmt * lace * 0.9 + core * (0.55 + 0.45 * fpat), 0.0, 1.0);
+      foam *= mix(0.55, 1.0, detailFade);
+
+      float ndl = max(dot(N, uSunDir), 0.0);
+      vec3 foamLit = uFoamColor * (uSunColor * 0.26 * ndl + uHorizon * 0.5 + uZenith * 0.28);
+      foamLit *= 0.72 + 0.28 * fpat;   // bubble self-shadowing variation
+
+      vec3 col = mix(under, refl, fresnel) + specCol + sss;
+      col = mix(col, foamLit, foam);
+
+      // blend into the sky at the horizon
+      float horizonFade = smoothstep(2800.0, 4800.0, distCam);
+      col = mix(col, skyColor(normalize(vWorldPos - cameraPosition)), horizonFade);
+
+      gl_FragColor = vec4(finalColor(col), 1.0);
+    }
+  `,
+});
+
+let waterMesh = null;
+function buildOcean() {
+  if (waterMesh) {
+    waterMesh.geometry.dispose();
+    scene.remove(waterMesh);
+  }
+  const res = params.meshResolution;
+  const RADIUS = 5000;
+  const geo = new THREE.PlaneGeometry(2, 2, res, res);
+  geo.rotateX(-Math.PI / 2);
+  const pos = geo.attributes.position;
+  // radial power warp: dense tessellation near the camera, sparse at the horizon
+  for (let i = 0; i < pos.count; i++) {
+    const u = pos.getX(i), v = pos.getZ(i);
+    pos.setX(i, Math.sign(u) * Math.pow(Math.abs(u), 2.5) * RADIUS);
+    pos.setZ(i, Math.sign(v) * Math.pow(Math.abs(v), 2.5) * RADIUS);
+  }
+  waterMesh = new THREE.Mesh(geo, waterMat);
+  waterMesh.frustumCulled = false;
+  scene.add(waterMesh);
+}
+buildOcean();
+
+// ---------------------------------------------------------------------------
+// Island mesh + palms (geometry from the same islandShape() the waves use)
+// ---------------------------------------------------------------------------
+function buildPalm(rng) {
+  const g = new THREE.Group();
+  const trunkMat = new THREE.MeshStandardMaterial({ color: 0x8a6a42, roughness: 1 });
+  const leafMat = new THREE.MeshStandardMaterial({ color: 0x2f6e2f, roughness: 0.9, side: THREE.DoubleSide });
+  const lean = 0.2 + rng() * 0.25;
+  const dir = new THREE.Vector3(Math.sin(lean), Math.cos(lean), 0);
+  const tip = new THREE.Vector3();
+  const up = new THREE.Vector3(0, 1, 0);
+  for (let s = 0; s < 4; s++) {
+    const seg = new THREE.Mesh(new THREE.CylinderGeometry(0.13 - s * 0.02, 0.17 - s * 0.02, 1.8, 6), trunkMat);
+    seg.position.copy(tip).addScaledVector(dir, 0.9);
+    seg.quaternion.setFromUnitVectors(up, dir);
+    g.add(seg);
+    tip.addScaledVector(dir, 1.7);
+    dir.y += 0.2;
+    dir.normalize();
+  }
+  const frondGeo = new THREE.PlaneGeometry(0.55, 2.8, 1, 6);
+  frondGeo.rotateX(-Math.PI / 2);
+  frondGeo.translate(0, 0, 1.4);
+  const fp = frondGeo.attributes.position;
+  for (let i = 0; i < fp.count; i++) {
+    const t = fp.getZ(i) / 2.8;
+    fp.setY(i, fp.getY(i) - t * t * 1.5);   // fronds droop
+  }
+  frondGeo.computeVertexNormals();
+  for (let i = 0; i < 8; i++) {
+    const f = new THREE.Mesh(frondGeo, leafMat);
+    f.position.copy(tip);
+    f.rotation.y = (i / 8) * Math.PI * 2 + rng() * 0.5;
+    g.add(f);
+  }
+  return g;
+}
+
+let islandMesh = null;
+const palmGroup = new THREE.Group();
+underwaterGroup.add(palmGroup);
+function rebuildIsland() {
+  waterUniforms.uIslandH.value = params.islandHeight;
+  waterUniforms.uIslandR.value = params.islandRadius;
+  if (islandMesh) { islandMesh.geometry.dispose(); underwaterGroup.remove(islandMesh); }
+  const size = params.islandRadius * 5.2;
+  const geo = new THREE.PlaneGeometry(size, size, 300, 300);
+  geo.rotateX(-Math.PI / 2);
+  const pos = geo.attributes.position;
+  for (let i = 0; i < pos.count; i++) {
+    pos.setY(i, islandShape(pos.getX(i) + ISLAND.x, pos.getZ(i) + ISLAND.z) + 0.05);
+  }
+  geo.computeVertexNormals();
+  islandMesh = new THREE.Mesh(geo, floorMat);
+  islandMesh.position.set(ISLAND.x, 0, ISLAND.z);
+  underwaterGroup.add(islandMesh);
+  // palms on the high ground
+  palmGroup.clear();
+  const rngP = mulberry32(7);
+  const spots = [[0.02, -0.08], [0.18, 0.12], [-0.14, 0.18], [-0.24, -0.12], [0.3, -0.02],
+                 [0.08, 0.25], [-0.32, 0.05], [0.24, -0.22], [-0.05, -0.3], [0.38, 0.18]];
+  for (const s of spots) {
+    const x = ISLAND.x + s[0] * params.islandRadius, z = ISLAND.z + s[1] * params.islandRadius;
+    const y = islandShape(x, z);
+    if (y - params.seafloorDepth < 1.5) continue; // spot is (nearly) underwater
+    const palm = buildPalm(rngP);
+    palm.position.set(x, y, z);
+    palm.rotation.y = rngP() * Math.PI * 2;
+    palm.scale.setScalar(0.8 + rngP() * 0.5);
+    palmGroup.add(palm);
+  }
+  // sun-baked boulders scattered along the beach ring
+  const rockMat = new THREE.MeshStandardMaterial({ color: 0x9a6b44, roughness: 0.9 });
+  for (let i = 0; i < 9; i++) {
+    const a = (i / 9) * Math.PI * 2 + rngP() * 0.6;
+    for (let rr = 0.35; rr < 1.1; rr += 0.06) { // walk outward to find the beach
+      const x = ISLAND.x + Math.cos(a) * rr * params.islandRadius;
+      const z = ISLAND.z + Math.sin(a) * rr * params.islandRadius;
+      const y = islandShape(x, z) - params.seafloorDepth;
+      if (y < 2.4 && y > 0.4) {
+        if (rngP() < 0.45) break; // not every beach spot gets rocks
+        const r = 1.2 + rngP() * 2.4;
+        const rock = new THREE.Mesh(new THREE.DodecahedronGeometry(r, 1), rockMat);
+        rock.position.set(x, y + params.seafloorDepth - r * 0.35, z);
+        rock.rotation.set(rngP() * 3, rngP() * 3, rngP() * 3);
+        rock.scale.set(1, 0.6 + rngP() * 0.4, 1);
+        palmGroup.add(rock);
+        break;
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Boats — procedural pirate sloop + rigid-body buoyancy physics
+// ---------------------------------------------------------------------------
+function buildBoatReal(scale = 1, opts = {}) {
+  const g = new THREE.Group();
+  const woodMat = new THREE.MeshStandardMaterial({ color: opts.hull || 0x6b4a2c, roughness: 0.82 });
+  const darkMat = new THREE.MeshStandardMaterial({ color: 0x45301c, roughness: 0.9 });
+  const sailMat = new THREE.MeshStandardMaterial({ color: 0xe8e0cf, roughness: 0.9, side: THREE.DoubleSide });
+
+  // hull: tapered, sheared box. forward = +z
+  const hullGeo = new THREE.BoxGeometry(2.4, 1.5, 7, 6, 3, 24);
+  {
+    const p = hullGeo.attributes.position;
+    for (let i = 0; i < p.count; i++) {
+      let x = p.getX(i), y = p.getY(i), z = p.getZ(i);
+      const t = z / 3.5;
+      const at = Math.abs(t);
+      const wf = t > 0 ? 1 - Math.pow(t, 2.0) * 0.9 : 1 - Math.pow(-t, 2.6) * 0.45;
+      x *= Math.max(wf, 0.06);
+      if (y < 0) {
+        x *= 1 - (-y / 0.75) * (0.45 + 0.25 * at);   // v-ish bottom
+        y *= 1 - 0.45 * Math.pow(at, 2);             // keel rises at bow/stern
+      }
+      y += 0.3 * Math.pow(at, 1.7);                  // sheer line
+      p.setXYZ(i, x, y, z);
+    }
+    hullGeo.computeVertexNormals();
+  }
+  g.add(new THREE.Mesh(hullGeo, woodMat));
+
+  // stern cabin
+  const cabin = new THREE.Mesh(new THREE.BoxGeometry(1.35, 0.7, 1.5), darkMat);
+  cabin.position.set(0, 0.95, -2.3);
+  g.add(cabin);
+
+  // mast
+  const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.1, 6.4, 8), darkMat);
+  mast.position.set(0, 3.4, 0.4);
+  g.add(mast);
+
+  // sail with a wind belly
+  const sailGeo = new THREE.PlaneGeometry(3.2, 4.0, 10, 6);
+  {
+    const p = sailGeo.attributes.position;
+    for (let i = 0; i < p.count; i++) {
+      const u = (p.getX(i) / 3.2) + 0.5;
+      p.setZ(i, Math.sin(u * Math.PI) * 0.6);
+    }
+    sailGeo.computeVertexNormals();
+  }
+  const sail = new THREE.Mesh(sailGeo, sailMat);
+  sail.position.set(0, 3.6, 0.34);
+  g.add(sail);
+
+  // bowsprit
+  const bow = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.06, 2.4, 6), darkMat);
+  bow.position.set(0, 1.05, 3.9);
+  bow.rotation.x = -1.15;
+  g.add(bow);
+
+  // flag
+  const flag = new THREE.Mesh(new THREE.PlaneGeometry(0.9, 0.45),
+    new THREE.MeshStandardMaterial({ color: 0xa02020, roughness: 0.9, side: THREE.DoubleSide }));
+  flag.position.set(0.45, 6.4, 0.4);
+  g.add(flag);
+
+  g.scale.setScalar(scale);
+  return g;
+}
+
+class Boat {
+  constructor(mesh, scale, controlled, ai) {
+    this.mesh = mesh;
+    this.scale = scale;
+    this.controlled = controlled;
+    this.ai = ai || null;
+    this.mass = 2200 * scale ** 3;
+    // box inertia approximation (w=2.4, h=1.5, l=7, scaled)
+    const w = 2.4 * scale, h = 1.5 * scale, l = 7 * scale;
+    this.I = new THREE.Vector3(
+      this.mass / 12 * (h * h + l * l),
+      this.mass / 12 * (w * w + l * l),
+      this.mass / 12 * (w * w + h * h)
+    );
+    this.vel = new THREE.Vector3();
+    this.angVel = new THREE.Vector3();
+    this.restSub = 0.5 * scale;
+    this.floaters = [
+      [-1.0, -0.55, 2.2], [1.0, -0.55, 2.2],
+      [-1.15, -0.55, 0], [1.15, -0.55, 0],
+      [-1.0, -0.55, -2.4], [1.0, -0.55, -2.4],
+      [0, -0.55, 3.3], [0, -0.55, -3.3],
+    ].map(a => new THREE.Vector3(a[0] * scale, a[1] * scale, a[2] * scale));
+    this._t = { f: new THREE.Vector3(), tq: new THREE.Vector3(), wp: new THREE.Vector3(),
+                r: new THREE.Vector3(), vp: new THREE.Vector3(), tmp: new THREE.Vector3(),
+                q: new THREE.Quaternion() };
+  }
+
+  step(dt, t) {
+    const m = this.mass, T = this._t;
+    const pos = this.mesh.position, quat = this.mesh.quaternion;
+    const F = T.f.set(0, -9.81 * m, 0);
+    const TQ = T.tq.set(0, 0, 0);
+    const n = this.floaters.length;
+    const kf = m * 9.81 / (n * this.restSub);
+    const cDamp = params.buoyancyDamping * 8.86 * m / n; // fraction of critical
+
+    for (const fl of this.floaters) {
+      T.wp.copy(fl).applyQuaternion(quat).add(pos);
+      T.r.copy(T.wp).sub(pos);
+      const h = waterHeightAt(T.wp.x, T.wp.z, t);
+      let sub = h - T.wp.y;
+      if (sub <= 0) continue;
+      sub = Math.min(sub, 1.4 * this.scale);
+      T.vp.copy(this.angVel).cross(T.r).add(this.vel);
+      const fy = kf * sub - cDamp * T.vp.y;
+      F.y += fy;
+      TQ.add(T.tmp.set(-T.r.z * fy, 0, T.r.x * fy)); // r x (0,fy,0)
+    }
+
+    // hull drag in boat frame — the keel resists sideways motion far more than forward
+    const qInv = T.q.copy(quat).invert();
+    const vLocal = T.tmp.copy(this.vel).applyQuaternion(qInv);
+    vLocal.set(-vLocal.x * 1.6, 0, -vLocal.z * 0.14).multiplyScalar(m);
+    F.add(vLocal.applyQuaternion(quat));
+
+    // propulsion
+    const fwd = new THREE.Vector3(0, 0, 1).applyQuaternion(quat);
+    fwd.y = 0; fwd.normalize();
+    const vFwd = this.vel.dot(fwd);
+    if (this.controlled) {
+      if (keys['w']) F.add(fwd.clone().multiplyScalar(m * params.thrustPower));
+      if (keys['s']) F.add(fwd.clone().multiplyScalar(-m * params.thrustPower * 0.45));
+      const steer = (keys['a'] ? 1 : 0) - (keys['d'] ? 1 : 0);
+      if (steer !== 0) {
+        const authority = 0.9 + Math.min(Math.abs(vFwd) * 0.35, 2.0);
+        TQ.y += steer * m * authority * (vFwd < -0.3 ? -1 : 1);
+      }
+    } else if (this.ai) {
+      F.add(fwd.clone().multiplyScalar(m * this.ai.thrust));
+      TQ.y += m * this.ai.turn;
+    }
+
+    // grounding: keel touches the sand → friction + slide back downhill
+    const ty = terrainWorldY(pos.x, pos.z);
+    const draft = 0.9 * this.scale;
+    if (-ty < draft + 0.5) {
+      const e = 2.0;
+      const gx = (terrainWorldY(pos.x + e, pos.z) - terrainWorldY(pos.x - e, pos.z)) / (2 * e);
+      const gz = (terrainWorldY(pos.x, pos.z + e) - terrainWorldY(pos.x, pos.z - e)) / (2 * e);
+      F.x -= gx * m * 9.81 * 0.7;
+      F.z -= gz * m * 9.81 * 0.7;
+      this.vel.multiplyScalar(Math.max(1 - 2.5 * dt, 0));
+      if (pos.y < ty + draft * 0.6) pos.y = ty + draft * 0.6;
+    }
+
+    // ballast keel: righting moment pulls the mast back upright, prevents capsize
+    const upB = T.tmp.set(0, 1, 0).applyQuaternion(quat);
+    const right = m * 9.81 * 0.55 * this.scale;
+    TQ.x += -upB.z * right;
+    TQ.z += upB.x * right;
+
+    // integrate linear
+    this.vel.addScaledVector(F, dt / m);
+    pos.addScaledVector(this.vel, dt);
+
+    // integrate angular in body space (diagonal inertia)
+    const tqB = TQ.applyQuaternion(qInv);
+    const wB = this._wB || (this._wB = new THREE.Vector3());
+    wB.copy(this.angVel).applyQuaternion(qInv);
+    wB.x += (tqB.x / this.I.x) * dt;
+    wB.y += (tqB.y / this.I.y) * dt;
+    wB.z += (tqB.z / this.I.z) * dt;
+    wB.x -= wB.x * 3.0 * dt;   // pitch drag
+    wB.y -= wB.y * 1.2 * dt;   // yaw drag
+    wB.z -= wB.z * 3.2 * dt;   // roll drag
+    this.angVel.copy(wB).applyQuaternion(quat);
+
+    const dq = new THREE.Quaternion(this.angVel.x * dt * 0.5, this.angVel.y * dt * 0.5, this.angVel.z * dt * 0.5, 0);
+    dq.multiply(quat);
+    quat.set(quat.x + dq.x, quat.y + dq.y, quat.z + dq.z, quat.w + dq.w).normalize();
+  }
+}
+
+const keys = {};
+window.addEventListener('keydown', e => { keys[e.key.toLowerCase()] = true; if (e.key.toLowerCase() === 'r') resetBoats(); });
+window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+
+const boats = [];
+{
+  const specs = [
+    { scale: 1.0, pos: [0, 1, 0], yaw: 0.4, controlled: true, hull: 0x6b4a2c },
+    { scale: 0.8, pos: [-32, 1, -22], yaw: 2.1, ai: { thrust: 0.55, turn: 0.22 }, hull: 0x54432e },
+    { scale: 1.25, pos: [30, 1, 26], yaw: -1.2, ai: { thrust: 0.45, turn: -0.16 }, hull: 0x7a4a35 },
+  ];
+  for (const s of specs) {
+    const mesh = buildBoatReal(s.scale, { hull: s.hull });
+    mesh.position.set(...s.pos);
+    mesh.rotation.y = s.yaw;
+    scene.add(mesh);
+    boats.push(new Boat(mesh, s.scale, !!s.controlled, s.ai));
+    boats[boats.length - 1]._spawn = { pos: [...s.pos], yaw: s.yaw };
+  }
+  // sunken wreck on the seafloor
+  const wreck = buildBoatReal(1.4, { hull: 0x3a3228 });
+  wreck.position.set(-20, 1.2, -30);
+  wreck.rotation.set(0.15, 1.1, 0.55);
+  wreck.children.forEach(c => { if (c.material) c.material = c.material.clone(); c.material.color.multiplyScalar(0.5); });
+  underwaterGroup.add(wreck);
+}
+function resetBoats() {
+  for (const b of boats) {
+    b.mesh.position.set(...b._spawn.pos);
+    b.mesh.quaternion.setFromEuler(new THREE.Euler(0, b._spawn.yaw, 0));
+    b.vel.set(0, 0, 0);
+    b.angVel.set(0, 0, 0);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Sun / sky update
+// ---------------------------------------------------------------------------
+function smoothstep01(e0, e1, x) { const t = Math.min(Math.max((x - e0) / (e1 - e0), 0), 1); return t * t * (3 - 2 * t); }
+
+function updateSun() {
+  const el = params.sunElevation * DEG, az = params.sunAzimuth * DEG;
+  const dir = shared.uSunDir.value;
+  dir.set(Math.cos(el) * Math.sin(az), Math.sin(el), Math.cos(el) * Math.cos(az)).normalize();
+  const t = Math.max(dir.y, 0);
+  const s = smoothstep01(0, 0.35, t);
+  const cd = 1 - Math.min(params.cloudCover, 1) * 0.55; // overcast dims everything
+  shared.uSunColor.value.setRGB(1.0, lerp(0.36, 0.94, s), lerp(0.12, 0.86, s)).multiplyScalar(lerp(1.6, 3.4, s) * cd);
+  shared.uZenith.value.setRGB(lerp(0.05, 0.10, s), lerp(0.07, 0.33, s), lerp(0.14, 0.72, s));
+  shared.uHorizon.value.setRGB(lerp(0.80, 0.55, s), lerp(0.42, 0.73, s), lerp(0.24, 0.90, s));
+  sunLight.position.copy(dir).multiplyScalar(500);
+  sunLight.color.setRGB(1.0, lerp(0.5, 0.96, s), lerp(0.3, 0.9, s));
+  sunLight.intensity = (0.6 + 2.4 * s) * cd;
+  hemi.intensity = 0.25 + 0.45 * s;
+}
+
+// ---------------------------------------------------------------------------
+// GUI
+// ---------------------------------------------------------------------------
+const gui = new GUI({ title: 'Ocean Controls' });
+
+params.resetAll = function () {
+  Object.assign(params, DEFAULTS);
+  renderer.setPixelRatio(params.pixelRatio);
+  buildOcean();
+  rebuildSpectrum();
+  syncSimpleUniforms();
+  applyColors();
+  updateSun();
+  updateSeafloorDepth();
+  onResize();
+  resetBoats();
+  camera.position.set(20, 10, 30);
+  controls.target.set(0, 1, 0);
+  zoomTarget = camera.position.distanceTo(controls.target);
+  gui.controllersRecursive().forEach(c => c.updateDisplay());
+};
+gui.add(params, 'resetAll').name('⟲ reset everything (boats + settings)');
+
+const presets = {
+  Calm() {
+    Object.assign(params, { amplitude: 0.35, steepness: 0.5, choppiness: 0.7, maxWavelength: 60,
+      waveCount: 36, foamIntensity: 0.35, detailStrength: 0.24, waveSpeed: 0.9, edgeFoamWidth: 1.6,
+      randomness: 0.55, directionSpread: 55, foamTrail: 0.5, shoaling: 1.0, surfFoam: 0.8,
+      cloudCover: 0.12, cloudDensity: 0.7, cloudSpeed: 0.6, cloudEvolve: 0.5 });
+    afterPreset();
+  },
+  Breeze() {
+    Object.assign(params, { amplitude: 1.0, steepness: 0.68, choppiness: 1.2, maxWavelength: 95,
+      waveCount: 48, foamIntensity: 0.85, detailStrength: 0.42, waveSpeed: 1.0, edgeFoamWidth: 2.0,
+      randomness: 0.75, directionSpread: 65, foamTrail: 0.9, shoaling: 1.0, surfFoam: 1.0,
+      cloudCover: 0.35, cloudDensity: 0.9, cloudSpeed: 1.0, cloudEvolve: 1.0 });
+    afterPreset();
+  },
+  Storm() {
+    // heavy but survivable: longer, more chaotic seas instead of steep walls
+    Object.assign(params, { amplitude: 1.3, steepness: 0.78, choppiness: 1.3, maxWavelength: 130,
+      waveCount: 56, foamIntensity: 1.5, detailStrength: 0.45, waveSpeed: 1.05, edgeFoamWidth: 3.0,
+      randomness: 0.95, directionSpread: 75, foamTrail: 1.5, shoaling: 1.0, surfFoam: 1.2,
+      cloudCover: 0.85, cloudDensity: 1.25, cloudSpeed: 2.4, cloudEvolve: 2.2 });
+    afterPreset();
+  },
+  'Shore Break'() {
+    // gentle out at sea, organized swell lines that rear up and break on the beach
+    Object.assign(params, { amplitude: 0.5, steepness: 0.62, choppiness: 1.0, maxWavelength: 48,
+      minWavelength: 3, waveCount: 40, directionSpread: 38, randomness: 0.55,
+      foamIntensity: 0.7, foamTrail: 1.1, edgeFoamWidth: 1.8, detailStrength: 0.34,
+      waveSpeed: 0.95, shoaling: 1.6, surfFoam: 1.35,
+      cloudCover: 0.28, cloudDensity: 0.85, cloudSpeed: 0.9, cloudEvolve: 0.8 });
+    afterPreset();
+  },
+};
+function afterPreset() {
+  rebuildSpectrum();
+  syncSimpleUniforms();
+  updateSun(); // cloud cover affects lighting
+  gui.controllersRecursive().forEach(c => c.updateDisplay());
+}
+
+const fPreset = gui.addFolder('Presets');
+fPreset.add(presets, 'Calm');
+fPreset.add(presets, 'Breeze');
+fPreset.add(presets, 'Storm');
+fPreset.add(presets, 'Shore Break');
+
+const fWaves = gui.addFolder('Waves');
+fWaves.add(params, 'windDirection', 0, 360, 1).onChange(rebuildSpectrum);
+fWaves.add(params, 'directionSpread', 0, 90, 1).onChange(rebuildSpectrum);
+fWaves.add(params, 'maxWavelength', 20, 250, 1).onChange(rebuildSpectrum);
+fWaves.add(params, 'minWavelength', 1, 20, 0.5).onChange(rebuildSpectrum);
+fWaves.add(params, 'steepness', 0, 1, 0.01).onChange(rebuildSpectrum);
+fWaves.add(params, 'amplitude', 0, 3, 0.01).onChange(rebuildSpectrum);
+fWaves.add(params, 'choppiness', 0, 1.8, 0.01).onChange(rebuildSpectrum);
+fWaves.add(params, 'randomness', 0, 1, 0.01).onChange(rebuildSpectrum);
+fWaves.add(params, 'waveSpeed', 0, 3, 0.01);
+fWaves.add(params, 'waveCount', 4, MAX_WAVES, 1).onChange(rebuildSpectrum);
+fWaves.add(params, 'randomizeSeed').name('randomize spectrum');
+
+const fDetail = gui.addFolder('Surface detail');
+fDetail.add(params, 'detailStrength', 0, 1, 0.01).onChange(syncSimpleUniforms);
+fDetail.add(params, 'detailScale', 0.05, 1.5, 0.01).onChange(syncSimpleUniforms);
+fDetail.close();
+
+const fFoam = gui.addFolder('Foam');
+fFoam.add(params, 'foamIntensity', 0, 2.5, 0.01).onChange(syncSimpleUniforms);
+fFoam.add(params, 'crestBias', 0.2, 1.1, 0.01).onChange(syncSimpleUniforms);
+fFoam.add(params, 'edgeFoamWidth', 0.2, 6, 0.1).onChange(syncSimpleUniforms);
+fFoam.add(params, 'foamScale', 0.05, 1.5, 0.01).onChange(syncSimpleUniforms);
+fFoam.add(params, 'foamTrail', 0, 2.5, 0.05).onChange(syncSimpleUniforms);
+fFoam.close();
+
+const fWater = gui.addFolder('Water body');
+fWater.addColor(params, 'deepColor').onChange(v => waterUniforms.uDeepColor.value.set(v).convertSRGBToLinear());
+fWater.addColor(params, 'shallowColor').onChange(v => waterUniforms.uShallowColor.value.set(v).convertSRGBToLinear());
+fWater.addColor(params, 'sssColor').onChange(v => waterUniforms.uSSSColor.value.set(v).convertSRGBToLinear());
+fWater.addColor(params, 'foamColor').onChange(v => waterUniforms.uFoamColor.value.set(v).convertSRGBToLinear());
+fWater.add(params, 'clarity', 2, 80, 0.5).onChange(v => { shared.uClarity.value = v; });
+fWater.add(params, 'refractionStrength', 0, 3, 0.01).onChange(syncSimpleUniforms);
+fWater.add(params, 'sssStrength', 0, 3, 0.01).onChange(syncSimpleUniforms);
+fWater.add(params, 'scatterStrength', 0, 2, 0.01).onChange(syncSimpleUniforms);
+fWater.add(params, 'seafloorDepth', 3, 40, 0.5).onChange(updateSeafloorDepth);
+fWater.close();
+
+const fIsland = gui.addFolder('Island & surf');
+fIsland.add(params, 'islandHeight', 0, 30, 0.5).onChange(rebuildIsland);
+fIsland.add(params, 'islandRadius', 50, 200, 1).onChange(rebuildIsland);
+fIsland.add(params, 'shoaling', 0, 2, 0.01).onChange(syncSimpleUniforms);
+fIsland.add(params, 'surfFoam', 0, 2, 0.01).onChange(syncSimpleUniforms);
+
+const fSun = gui.addFolder('Sun & sky');
+fSun.add(params, 'sunElevation', 1, 89, 0.5).onChange(updateSun);
+fSun.add(params, 'sunAzimuth', 0, 360, 1).onChange(updateSun);
+fSun.add(params, 'exposure', 0.3, 2.5, 0.01).onChange(v => { shared.uExposure.value = v; renderer.toneMappingExposure = v; });
+fSun.add(params, 'cloudCover', 0, 1, 0.01).onChange(() => { syncSimpleUniforms(); updateSun(); });
+fSun.add(params, 'cloudDensity', 0.2, 1.5, 0.01).onChange(syncSimpleUniforms);
+fSun.add(params, 'cloudScale', 0.3, 3, 0.01).onChange(syncSimpleUniforms);
+fSun.add(params, 'cloudSpeed', 0, 4, 0.05);
+fSun.add(params, 'cloudEvolve', 0, 3, 0.05).name('cloud evolution');
+fSun.close();
+
+const fBoats = gui.addFolder('Boats');
+fBoats.add(params, 'followBoat').name('camera follows boat');
+fBoats.add(params, 'thrustPower', 0.5, 8, 0.1);
+fBoats.add(params, 'buoyancyDamping', 0.05, 0.9, 0.01);
+fBoats.add(params, 'resetBoats').name('reset boats (R)');
+fBoats.close();
+
+// quality tiers: each step scales every real cost center together —
+// vertex load (mesh res x wave count), fragment load (pixel ratio, detail
+// normals, cloud octaves), and the refraction pre-pass resolution
+const QUALITY_TIERS = {
+  low:    { meshResolution: 128,  rtScale: 0.5,  pixelRatio: Math.min(0.75, window.devicePixelRatio),
+            waveCount: 24, detailStrength: 0.0,  cloudOctaves: 2 },
+  medium: { meshResolution: 256,  rtScale: 0.5,  pixelRatio: Math.min(1.0, window.devicePixelRatio),
+            waveCount: 36, detailStrength: 0.3,  cloudOctaves: 3 },
+  high:   { meshResolution: 512,  rtScale: 0.75, pixelRatio: Math.min(1.5, window.devicePixelRatio),
+            waveCount: 48, detailStrength: 0.42, cloudOctaves: 4 },
+  ultra:  { meshResolution: 1024, rtScale: 1.0,  pixelRatio: Math.min(2.0, window.devicePixelRatio),
+            waveCount: 64, detailStrength: 0.5,  cloudOctaves: 5 },
+};
+function applyQuality() {
+  const t = QUALITY_TIERS[params.quality];
+  if (!t) return;
+  Object.assign(params, t);
+  renderer.setPixelRatio(params.pixelRatio);
+  buildOcean();
+  rebuildSpectrum();
+  syncSimpleUniforms();
+  onResize(); // resizes the refraction RT for the new rtScale/pixelRatio
+  gui.controllersRecursive().forEach(c => c.updateDisplay());
+}
+
+const fQual = gui.addFolder('Quality');
+fQual.add(params, 'quality', ['low', 'medium', 'high', 'ultra']).name('quality preset').onChange(applyQuality);
+fQual.add(params, 'meshResolution', [128, 256, 384, 512, 768, 1024]).name('ocean mesh res').onChange(buildOcean);
+fQual.add(params, 'rtScale', [0.5, 0.75, 1.0]).name('refraction RT scale').onChange(resizeRT);
+fQual.add(params, 'pixelRatio', 0.5, Math.max(2, window.devicePixelRatio), 0.05).onChange(v => {
+  renderer.setPixelRatio(v); onResize();
+});
+fQual.add(params, 'cloudOctaves', 2, 5, 1).name('cloud detail octaves').onChange(syncSimpleUniforms);
+fQual.close();
+
+function syncSimpleUniforms() {
+  waterUniforms.uDetailStrength.value = params.detailStrength;
+  waterUniforms.uDetailScale.value = params.detailScale;
+  waterUniforms.uFoamIntensity.value = params.foamIntensity;
+  waterUniforms.uCrestBias.value = params.crestBias;
+  waterUniforms.uEdgeWidth.value = params.edgeFoamWidth;
+  waterUniforms.uFoamScale.value = params.foamScale;
+  waterUniforms.uRefrStrength.value = params.refractionStrength;
+  waterUniforms.uSSSStrength.value = params.sssStrength;
+  waterUniforms.uFoamTrail.value = params.foamTrail;
+  waterUniforms.uShoal.value = params.shoaling;
+  waterUniforms.uSurfFoam.value = params.surfFoam;
+  waterUniforms.uScatter.value = params.scatterStrength;
+  shared.uCloudCover.value = params.cloudCover;
+  shared.uCloudDensity.value = params.cloudDensity;
+  shared.uCloudScale.value = params.cloudScale;
+  shared.uCloudOct.value = Math.round(params.cloudOctaves);
+}
+
+function applyColors() {
+  waterUniforms.uDeepColor.value.set(params.deepColor).convertSRGBToLinear();
+  waterUniforms.uShallowColor.value.set(params.shallowColor).convertSRGBToLinear();
+  waterUniforms.uSSSColor.value.set(params.sssColor).convertSRGBToLinear();
+  waterUniforms.uFoamColor.value.set(params.foamColor).convertSRGBToLinear();
+  shared.uClarity.value = params.clarity;
+  shared.uExposure.value = params.exposure;
+  renderer.toneMappingExposure = params.exposure;
+}
+
+// ---------------------------------------------------------------------------
+// Resize
+// ---------------------------------------------------------------------------
+function onResize() {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  const size = renderer.getDrawingBufferSize(new THREE.Vector2());
+  waterUniforms.uResolution.value.copy(size);
+  resizeRT();
+}
+window.addEventListener('resize', onResize);
+
+// ---------------------------------------------------------------------------
+// Main loop
+// ---------------------------------------------------------------------------
+rebuildSpectrum();
+syncSimpleUniforms();
+updateSun();
+updateSeafloorDepth(); // also builds the island + palms
+onResize();
+
+// debug hook for headless tooling
+window.__dbg = { camera, controls, params, boats, islandShape, terrainWorldY, waterHeightAt,
+                 rebuildIsland, rebuildSpectrum, updateSeafloorDepth, syncSimpleUniforms,
+                 updateSun, applyColors, applyQuality, buildOcean, ISLAND, scene, renderer };
+
+const clock = new THREE.Clock();
+const fpsEl = document.getElementById('fps');
+const uwEl = document.getElementById('underwater');
+let fpsFrames = 0, fpsTime = 0;
+const prevBoatPos = boats[0].mesh.position.clone();
+
+function animate() {
+  requestAnimationFrame(animate);
+  const rawDt = Math.min(clock.getDelta(), 1 / 30);
+  phaseTime += rawDt * params.waveSpeed;
+  shared.uTime.value = phaseTime;
+  shared.uCloudTime.value += rawDt * params.cloudSpeed;
+  shared.uCloudEvolve.value += rawDt * params.cloudEvolve * 0.02;
+
+  // physics (2 substeps)
+  const sub = rawDt / 2;
+  for (let s = 0; s < 2; s++) {
+    for (const b of boats) b.step(sub, phaseTime);
+  }
+
+  // camera follow
+  const main = boats[0];
+  if (params.followBoat) {
+    const delta = main.mesh.position.clone().sub(prevBoatPos);
+    delta.y = 0;
+    camera.position.add(delta);
+    controls.target.lerp(main.mesh.position.clone().add(new THREE.Vector3(0, 1.2, 0)), 0.12);
+  }
+  prevBoatPos.copy(main.mesh.position);
+
+  // ease the camera toward the wheel's target distance every frame
+  {
+    const cur = camera.position.distanceTo(controls.target);
+    const next = lerp(cur, zoomTarget, 1 - Math.exp(-rawDt * 7));
+    if (Math.abs(next - cur) > 1e-4) {
+      camera.position.sub(controls.target).multiplyScalar(next / cur).add(controls.target);
+    }
+  }
+  controls.update();
+
+  // ocean + sky follow camera
+  waterMesh.position.set(camera.position.x, 0, camera.position.z);
+  skyDome.position.copy(camera.position);
+
+  // underwater tint
+  const camWater = waterHeightAt(camera.position.x, camera.position.z, phaseTime);
+  uwEl.style.display = camera.position.y < camWater + 0.15 ? 'block' : 'none';
+
+  // pass 1: scene without water -> linear HDR RT with depth (refraction + clarity source)
+  waterMesh.visible = false;
+  floorMat.uniforms.uApplyTM.value = 0.0;
+  renderer.toneMapping = THREE.NoToneMapping;
+  renderer.setRenderTarget(sceneRT);
+  renderer.render(scene, camera);
+
+  // pass 2: full scene to screen
+  waterMesh.visible = true;
+  floorMat.uniforms.uApplyTM.value = 1.0;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.setRenderTarget(null);
+  renderer.render(scene, camera);
+
+  // fps
+  fpsFrames++; fpsTime += rawDt;
+  if (fpsTime >= 0.5) {
+    const kn = (main.vel.length() * 1.944).toFixed(1);
+    fpsEl.textContent = `${Math.round(fpsFrames / fpsTime)} fps · ${renderer.info.render.triangles.toLocaleString()} tris · boat ${kn} kn`;
+    fpsFrames = 0; fpsTime = 0;
+  }
+}
+animate();
+</script>
+</body>
+</html>

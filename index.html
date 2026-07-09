@@ -236,15 +236,26 @@ function waveDisplacement(px, pz, t, out) {
   const n = WS.count, chop = WS.chop;
   const d = Math.max(-terrainWorldY(px, pz), 0.12);
   const sh = params.shoaling;
+  // lee sheltering — mirror of the vertex shader so buoyancy tracks the calm
+  // water behind the island
+  const R = params.islandRadius;
+  const wl = Math.hypot(waterUniforms.uWindDir.value.x, waterUniforms.uWindDir.value.y) || 1;
+  const wdx = waterUniforms.uWindDir.value.x / wl, wdz = waterUniforms.uWindDir.value.y / wl;
+  const rx = px - ISLAND.x, rz = pz - ISLAND.z;
+  const along = rx * wdx + rz * wdz;
+  const across = Math.hypot(rx - wdx * along, rz - wdz * along);
+  const sstep = (a, b, x) => { const tt = Math.min(Math.max((x - a) / (b - a), 0), 1); return tt * tt * (3 - 2 * tt); };
+  const lee = sstep(0, R * 0.4, along) * (1 - sstep(R * 0.55, R * 1.2, across)) * (1 - sstep(R * 2.0, R * 4.0, along));
+  const shelter = 1 - 0.8 * lee;
   for (let i = 0; i < n; i++) {
     const w = WS.list[i];
     const k = (2 * Math.PI) / w.L;
     const om = Math.sqrt(9.81 * k);
     const kd = Math.min(k * d, 10);
     const tk = Math.tanh(kd);
-    const shoalA = 1 + (Math.min(1 / Math.sqrt(Math.max(tk, 0.05)), 2.2) - 1) * sh;
-    const Aeff = Math.min(w.A * shoalA, 0.5 * d);
-    const qa = chop * (1 + sh * (1 - tk) * 1.5) / (k * n);
+    const shoalA = 1 + (Math.min(1 / Math.sqrt(Math.max(tk, 0.08)), 1.8) - 1) * sh;
+    const Aeff = Math.min(w.A * shoalA, 0.5 * d) * shelter;
+    const qa = chop * (1 + sh * (1 - tk) * 1.5) / (k * n) * shelter;
     const th = k * (w.dx * px + w.dz * pz) - om * t + w.phase;
     const S = Math.sin(th), C = Math.cos(th);
     dx += qa * w.dx * C;
@@ -649,6 +660,7 @@ const waterMat = new THREE.ShaderMaterial({
     uniform float uFloorY;
     uniform float uShoal;
     uniform float uSurfFoam;
+    uniform vec2 uWindDir;
     varying vec3 vWorldPos;
     varying vec3 vNormal;
     varying float vJ;      // jacobian for crest foam
@@ -678,6 +690,16 @@ const waterMat = new THREE.ShaderMaterial({
       vec3 wp = (modelMatrix * vec4(position, 1.0)).xyz;
       vec2 p = wp.xz;
       float dpt = max(-terrainY(p), 0.12);  // local water depth
+      // lee sheltering: the island blocks incoming swell, so water directly
+      // downwind of it stays calm instead of throwing up giant waves behind it
+      vec2 wDir = normalize(uWindDir + vec2(1e-5));
+      vec2 toP = p - uIslandC;
+      float along = dot(toP, wDir);
+      float across = length(toP - wDir * along);
+      float lee = smoothstep(0.0, uIslandR * 0.4, along)
+                * (1.0 - smoothstep(uIslandR * 0.55, uIslandR * 1.2, across))
+                * (1.0 - smoothstep(uIslandR * 2.0, uIslandR * 4.0, along));
+      float shelter = 1.0 - 0.8 * lee;
       vec3 disp = vec3(0.0);
       vec3 tx = vec3(1.0, 0.0, 0.0);
       vec3 tz = vec3(0.0, 0.0, 1.0);
@@ -695,9 +717,9 @@ const waterMat = new THREE.ShaderMaterial({
         // 0.5*depth breaking limit caps them right at the shoreline
         float kd = min(k * dpt, 10.0);
         float tk = tanhc(kd);
-        float shoalA = 1.0 + (clamp(inversesqrt(max(tk, 0.05)), 1.0, 2.2) - 1.0) * uShoal;
-        float Aeff = min(A * shoalA, 0.5 * dpt);
-        float qa = uChop * (1.0 + uShoal * (1.0 - tk) * 1.5) / float(uNumWaves); // crests pitch forward in shallows
+        float shoalA = 1.0 + (clamp(inversesqrt(max(tk, 0.08)), 1.0, 1.8) - 1.0) * uShoal;
+        float Aeff = min(A * shoalA, 0.5 * dpt) * shelter;
+        float qa = uChop * (1.0 + uShoal * (1.0 - tk) * 1.5) / float(uNumWaves) * shelter; // crests pitch forward in shallows
         float th = k * dot(D, p) - om * uTime + uPhases[i];
         float S = sin(th), C = cos(th);
         disp += vec3((qa / k) * D.x * C, Aeff * S, (qa / k) * D.y * C);
@@ -712,6 +734,9 @@ const waterMat = new THREE.ShaderMaterial({
         jxxC -= qxx * SC; jzzC -= qzz * SC; jxzC -= qxz * SC;
       }
       vec3 dwp = wp + disp;
+      // keep a thin film of water over the shallow shelf so the beach sand is
+      // never left bare in a wave trough (reads as wet, glassy swash instead)
+      dwp.y = max(dwp.y, min(terrainY(p) + 0.10, -0.03));
       vNormal = normalize(cross(tz, tx));
       float JA = (1.0 + jxx) * (1.0 + jzz) - jxz * jxz;
       float JB = (1.0 + jxxB) * (1.0 + jzzB) - jxzB * jxzB;
@@ -722,7 +747,7 @@ const waterMat = new THREE.ShaderMaterial({
       float steep = disp.y / max(dpt, 0.15);
       float brk = smoothstep(0.28, 0.6, steep) * uShoal;
       brk += smoothstep(2.2, 0.4, dpt) * 0.25;
-      vBreak = clamp(brk * uSurfFoam, 0.0, 1.5);
+      vBreak = clamp(brk * uSurfFoam * shelter, 0.0, 1.5);
       vCrest = disp.y / max(uAmpSum * 0.6, 0.001);
       vWorldPos = dwp;
       vec4 mv = viewMatrix * vec4(dwp, 1.0);

@@ -507,14 +507,12 @@ const floorMat = new THREE.ShaderMaterial({
     varying vec3 vN;
     void main() {
       vec3 N = normalize(vN);
-      // sandy albedo with patchy variation
-      float sandPatch = fbm(vWp.xz * 0.08);
-      vec3 albedo = mix(vec3(0.70, 0.62, 0.45), vec3(0.54, 0.48, 0.36), sandPatch);
-      albedo *= 0.88 + 0.24 * fbm(vWp.xz * 0.9);
-      // dark mottled reef / seagrass patches on the submerged sand
-      float reef = smoothstep(0.55, 0.75, fbm(vWp.xz * 0.045 + 13.7));
-      reef *= smoothstep(-0.6, -2.2, vWp.y);   // underwater only
-      albedo = mix(albedo, vec3(0.12, 0.20, 0.15), reef * 0.85);
+      // clean, uniform sandy seabed — only a very gentle large-scale tone shift,
+      // no blotchy reef/seagrass patches (they looked like an ugly material
+      // through the clear water)
+      float sandPatch = fbm(vWp.xz * 0.045);
+      vec3 albedo = mix(vec3(0.76, 0.68, 0.51), vec3(0.68, 0.60, 0.44), sandPatch);
+      albedo *= 0.95 + 0.08 * fbm(vWp.xz * 0.5);
       // beach zones: a BROAD, dark wet-sand band around the waterline so any
       // sand briefly bared by a receding wave still reads as wet beach (not the
       // pale, watery-looking dry sand). It fades up into dry sand on the berm.
@@ -1512,11 +1510,22 @@ function animate() {
   }
   controls.update();
 
+  // keep the camera above the water — never let the view dip underwater
+  {
+    const wy = waterHeightAt(camera.position.x, camera.position.z, phaseTime);
+    const minY = wy + 0.6;
+    if (camera.position.y < minY) {
+      camera.position.y = minY;
+      zoomTarget = camera.position.distanceTo(controls.target); // stop dollying into the water
+      controls.update();
+    }
+  }
+
   // ocean + sky follow camera
   waterMesh.position.set(camera.position.x, 0, camera.position.z);
   skyDome.position.copy(camera.position);
 
-  // underwater tint
+  // underwater tint (safety net for transition frames)
   const camWater = waterHeightAt(camera.position.x, camera.position.z, phaseTime);
   uwEl.style.display = camera.position.y < camWater + 0.15 ? 'block' : 'none';
 

@@ -1193,8 +1193,30 @@ class Boat {
 }
 
 const keys = {};
-window.addEventListener('keydown', e => { keys[e.key.toLowerCase()] = true; if (e.key.toLowerCase() === 'r') resetBoats(); });
-window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+// normalise to logical actions by PHYSICAL key position (e.code), so it works
+// regardless of keyboard layout / OS (Mac, AZERTY, etc.); arrows as a fallback
+function keyAction(e) {
+  switch (e.code) {
+    case 'KeyW': case 'ArrowUp':    return 'w';
+    case 'KeyS': case 'ArrowDown':  return 's';
+    case 'KeyA': case 'ArrowLeft':  return 'a';
+    case 'KeyD': case 'ArrowRight': return 'd';
+    case 'KeyR':                    return 'r';
+  }
+  return (e.key || '').toLowerCase();
+}
+window.addEventListener('keydown', e => {
+  const k = keyAction(e);
+  if (k === 'w' || k === 'a' || k === 's' || k === 'd' || k === 'r') e.preventDefault();
+  keys[k] = true;
+  if (k === 'r') resetBoats();
+});
+window.addEventListener('keyup', e => { keys[keyAction(e)] = false; });
+// make sure the page holds keyboard focus, and drop any "stuck" keys on blur
+renderer.domElement.setAttribute('tabindex', '0');
+renderer.domElement.addEventListener('pointerdown', () => { window.focus(); renderer.domElement.focus(); });
+window.addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
+window.focus();
 
 const boats = [];
 {

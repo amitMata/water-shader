@@ -515,12 +515,14 @@ const floorMat = new THREE.ShaderMaterial({
       float reef = smoothstep(0.55, 0.75, fbm(vWp.xz * 0.045 + 13.7));
       reef *= smoothstep(-0.6, -2.2, vWp.y);   // underwater only
       albedo = mix(albedo, vec3(0.12, 0.20, 0.15), reef * 0.85);
-      // beach zones: dark wet swash band at the waterline, pale dry sand,
-      // then vegetation on the high ground
-      float wet = smoothstep(-1.4, -0.3, vWp.y) * smoothstep(1.1, 0.15, vWp.y);
-      albedo = mix(albedo, albedo * 0.5, wet * 0.9);
-      float dry = smoothstep(0.4, 1.4, vWp.y);
-      albedo = mix(albedo, vec3(0.76, 0.66, 0.47), dry * 0.75);
+      // beach zones: a BROAD, dark wet-sand band around the waterline so any
+      // sand briefly bared by a receding wave still reads as wet beach (not the
+      // pale, watery-looking dry sand). It fades up into dry sand on the berm.
+      float wet = smoothstep(-2.6, -0.6, vWp.y) * smoothstep(2.6, 0.1, vWp.y);
+      vec3 wetSand = albedo * 0.40 * vec3(0.94, 0.9, 0.84); // darker + faintly cooler
+      albedo = mix(albedo, wetSand, clamp(wet, 0.0, 1.0));
+      float dry = smoothstep(2.0, 3.4, vWp.y);
+      albedo = mix(albedo, vec3(0.78, 0.68, 0.49), dry * 0.7);
       float veg = smoothstep(3.2, 6.0, vWp.y + (fbm(vWp.xz * 0.13) - 0.5) * 4.0);
       vec3 grass = mix(vec3(0.09, 0.19, 0.05), vec3(0.19, 0.29, 0.09), fbm(vWp.xz * 0.35));
       albedo = mix(albedo, grass, veg);
@@ -529,7 +531,7 @@ const floorMat = new THREE.ShaderMaterial({
       float n1 = 1.0 - abs(2.0 * fbm(cp + vec2(uTime * 0.06, uTime * 0.045)) - 1.0);
       float n2 = 1.0 - abs(2.0 * fbm(cp * 1.63 - vec2(uTime * 0.05, uTime * 0.07)) - 1.0);
       float caustic = pow(clamp(n1 * n2 + 0.15, 0.0, 1.0), 5.0) * 3.0;
-      caustic *= smoothstep(0.2, -0.5, vWp.y);
+      caustic *= smoothstep(0.0, -0.8, vWp.y);  // no bright shimmer on bared wet sand
       float depth = max(-vWp.y, 0.0);
       // downward sunlight absorption (red dies first)
       vec3 absorb = vec3(0.9, 0.32, 0.22) * (6.0 / uClarity) * 0.6;
@@ -736,7 +738,7 @@ const waterMat = new THREE.ShaderMaterial({
       vec3 dwp = wp + disp;
       // keep a thin film of water over the shallow shelf so the beach sand is
       // never left bare in a wave trough (reads as wet, glassy swash instead)
-      dwp.y = max(dwp.y, min(terrainY(p) + 0.10, -0.03));
+      dwp.y = max(dwp.y, min(terrainY(p) + 0.28, -0.02));
       vNormal = normalize(cross(tz, tx));
       float JA = (1.0 + jxx) * (1.0 + jzz) - jxz * jxz;
       float JB = (1.0 + jxxB) * (1.0 + jzzB) - jxzB * jxzB;
